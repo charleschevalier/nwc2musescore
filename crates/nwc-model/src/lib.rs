@@ -77,6 +77,10 @@ pub struct Instrument {
 pub struct LyricLine {
     /// Raw lyric text, NWC-style separators preserved (`-` continued, `_` extender, ` ` single).
     pub text: String,
+    /// Individual syllables extracted from the lyric block. Each syllable
+    /// corresponds to one note-anchor in NWC's display. The writer attaches
+    /// them to non-rest notes in order.
+    pub syllables: Vec<String>,
 }
 
 /// One element on a staff. Objects are time-implicit; the writer derives

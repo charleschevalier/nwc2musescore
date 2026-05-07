@@ -377,6 +377,7 @@ fn parse_lyrics_block(
         }
         let _ = cur.read_u16_le("lyric junk")?;
         let mut text = String::new();
+        let mut syllables: Vec<String> = Vec::new();
         let mut iter = 0usize;
         while cur.pos() < target && iter < 1000 {
             iter += 1;
@@ -388,11 +389,12 @@ fn parse_lyrics_block(
                 text.push(' ');
             }
             text.push_str(&s);
+            syllables.push(s);
         }
         if cur.pos() < target {
             cur.skip(target - cur.pos(), "lyric tail")?;
         }
-        out.push(LyricLine { text });
+        out.push(LyricLine { text, syllables });
     }
     Ok(out)
 }
@@ -528,15 +530,20 @@ fn parse_keysig(cur: &mut Cursor<'_>) -> Result<StaffObject, NwcError> {
 }
 
 fn parse_barline(cur: &mut Cursor<'_>) -> Result<StaffObject, NwcError> {
-    let style = cur.read_u8("barline style")?;
+    let style_byte = cur.read_u8("barline style")?;
     let _local_repeat_count = cur.read_u8("barline lrc")?;
-    let bar_style = match style {
-        1 => BarStyle::Final,
-        2 => BarStyle::Double,
-        3 => BarStyle::Heavy,
-        _ => BarStyle::Single,
-    };
-    Ok(StaffObject::Bar(Bar { style: bar_style }))
+    // Music21 BarStyles index:
+    //   0 Single, 1 Double, 2 SectionOpen, 3 SectionClose,
+    //   4 LocalRepeatOpen, 5 LocalRepeatClose,
+    //   6 MasterRepeatOpen, 7 MasterRepeatClose
+    match style_byte {
+        4 | 6 => Ok(StaffObject::RepeatOpen),
+        5 | 7 => Ok(StaffObject::RepeatClose { count: None }),
+        1 => Ok(StaffObject::Bar(Bar { style: BarStyle::Double })),
+        2 => Ok(StaffObject::Bar(Bar { style: BarStyle::Heavy })),
+        3 => Ok(StaffObject::Bar(Bar { style: BarStyle::Final })),
+        _ => Ok(StaffObject::Bar(Bar { style: BarStyle::Single })),
+    }
 }
 
 fn parse_ending(cur: &mut Cursor<'_>) -> Result<StaffObject, NwcError> {
@@ -995,13 +1002,16 @@ fn staff_pos_to_pitch(pos: i16, attribute2: u8, clef: ClefKind) -> Pitch {
         5 => Step::A,
         _ => Step::B,
     };
+    // Music21 AlterationTexts table (index = attribute2 & 0x07):
+    //   0 Sharp '#', 1 Flat 'b', 2 Natural 'n',
+    //   3 Double-sharp 'x', 4 Double-flat 'v', 5 none
     let alter_index = attribute2 & 0x07;
     let (alter, displayed) = match alter_index {
-        1 => (1, Some(nwc_model::Accidental::Sharp)),
-        2 => (2, Some(nwc_model::Accidental::DoubleSharp)),
-        3 => (-1, Some(nwc_model::Accidental::Flat)),
+        0 => (1, Some(nwc_model::Accidental::Sharp)),
+        1 => (-1, Some(nwc_model::Accidental::Flat)),
+        2 => (0, Some(nwc_model::Accidental::Natural)),
+        3 => (2, Some(nwc_model::Accidental::DoubleSharp)),
         4 => (-2, Some(nwc_model::Accidental::DoubleFlat)),
-        5 => (0, Some(nwc_model::Accidental::Natural)),
         _ => (0, None),
     };
     Pitch {

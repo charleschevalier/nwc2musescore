@@ -10,8 +10,8 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
 use nwc_model::{
-    Accidental, Clef, ClefKind, KeySignature, Note, Pitch, Rest, Score, Staff, StaffObject,
-    Step, TimeSigKind, TimeSignature,
+    Accidental, BarStyle, Clef, ClefKind, KeySignature, Note, Pitch, Rest, Score, Staff,
+    StaffObject, Step, TimeSigKind, TimeSignature,
 };
 
 use crate::context::WriterCtx;
@@ -140,6 +140,10 @@ fn write_part<W: Write>(w: &mut Writer<W>, staff: &Staff, idx: usize) -> Result<
     let mut ctx = WriterCtx::new(DEFAULT_DIVISIONS);
     let measures_v = measures::group(staff);
 
+    // Lyric anchoring index per verse: each non-rest, non-grace note that
+    // appears in the part consumes one syllable from each verse in order.
+    let mut lyric_cursors: Vec<usize> = vec![0; staff.lyrics.len()];
+
     // Track per-part state so we can emit <attributes> changes only when
     // they actually change between measures.
     let mut emitted_initial_attributes = false;
@@ -197,19 +201,31 @@ fn write_part<W: Write>(w: &mut Writer<W>, staff: &Staff, idx: usize) -> Result<
             emitted_initial_attributes = true;
         }
 
+        if measure.opens_repeat {
+            write_left_repeat(w)?;
+        }
+
         for obj in musical_objects {
             match obj {
-                StaffObject::Note(n) => write_note(w, n, ctx.divisions, false)?,
+                StaffObject::Note(n) => {
+                    let lyrics = pop_syllables(&staff.lyrics, &mut lyric_cursors);
+                    write_note(w, n, ctx.divisions, false, &lyrics)?;
+                }
                 StaffObject::Rest(r) => write_rest(w, r, ctx.divisions)?,
-                StaffObject::Chord(c) => write_chord(w, c, ctx.divisions)?,
+                StaffObject::Chord(c) => {
+                    let lyrics = pop_syllables(&staff.lyrics, &mut lyric_cursors);
+                    write_chord(w, c, ctx.divisions, &lyrics)?;
+                }
                 _ => {
                     // Other event kinds are dropped for now (Tempo,
-                    // Dynamic, Text, Flow, Bar, Ending, ...). M3 work.
+                    // Dynamic, Text, Flow, Ending, ...). M3 work.
                 }
             }
         }
 
-        // M1: not emitting <barline> for the closing bar; default barline is fine.
+        if let Some(bar) = measure.closing_bar {
+            write_closing_bar(w, bar)?;
+        }
 
         w.write_event(Event::End(BytesEnd::new("measure"))).map_err(xml_err)?;
     }
@@ -298,6 +314,7 @@ fn write_note<W: Write>(
     n: &Note,
     divisions: u32,
     is_chord_member: bool,
+    lyrics: &[(u32, String, bool)],
 ) -> Result<(), WriteError> {
     w.write_event(Event::Start(BytesStart::new("note"))).map_err(xml_err)?;
     if is_chord_member {
@@ -314,18 +331,146 @@ fn write_note<W: Write>(
     if let Some(acc) = n.pitch.displayed_accidental {
         write_text_element(w, "accidental", accidental_name(acc))?;
     }
+    if !is_chord_member {
+        for (verse, syllable, next_continues) in lyrics {
+            write_lyric(w, *verse, syllable, *next_continues)?;
+        }
+    }
     w.write_event(Event::End(BytesEnd::new("note"))).map_err(xml_err)?;
     Ok(())
+}
+
+fn write_lyric<W: Write>(
+    w: &mut Writer<W>,
+    verse: u32,
+    syllable: &str,
+    next_continues: bool,
+) -> Result<(), WriteError> {
+    let mut e = BytesStart::new("lyric");
+    let n = verse.to_string();
+    e.push_attribute(("number", n.as_str()));
+    w.write_event(Event::Start(e)).map_err(xml_err)?;
+    // NWC encodes syllable boundaries via prefixes / suffixes on the
+    // syllable text itself:
+    //   leading '-'      → continuation of the previous syllable's word
+    //   leading ' '      → start of a new word
+    //   trailing '_'     → extender (held over)
+    //   trailing '-' alone is rare; seen mid-word too
+    // The syllabic dimension is computed as a function of "this syllable
+    // starts a new word" and "the next syllable continues this word".
+    let starts_continuation = syllable.starts_with('-');
+    let extender = syllable.ends_with('_');
+    let mut core = syllable.to_string();
+    if let Some(stripped) = core.strip_prefix('-') {
+        core = stripped.to_string();
+    }
+    if let Some(stripped) = core.strip_prefix(' ') {
+        core = stripped.to_string();
+    }
+    if let Some(stripped) = core.strip_prefix('\r') {
+        core = stripped.to_string();
+    }
+    if let Some(stripped) = core.strip_suffix('_') {
+        core = stripped.to_string();
+    }
+    let syllabic = match (starts_continuation, next_continues) {
+        (false, false) => "single",
+        (false, true) => "begin",
+        (true, true) => "middle",
+        (true, false) => "end",
+    };
+    write_text_element(w, "syllabic", syllabic)?;
+    write_text_element(w, "text", &core)?;
+    if extender {
+        w.write_event(Event::Empty(BytesStart::new("extend"))).map_err(xml_err)?;
+    }
+    w.write_event(Event::End(BytesEnd::new("lyric"))).map_err(xml_err)?;
+    Ok(())
+}
+
+/// Pop one syllable per verse, returning `(verse_number, syllable, next_continues)` triples.
+/// `next_continues` is true if the *next* syllable in the same verse begins
+/// with `-` (i.e., this one is mid-word).
+fn pop_syllables(
+    lyrics: &[nwc_model::LyricLine],
+    cursors: &mut [usize],
+) -> Vec<(u32, String, bool)> {
+    let mut out = Vec::new();
+    for (verse_idx, line) in lyrics.iter().enumerate() {
+        if cursors[verse_idx] < line.syllables.len() {
+            let s = line.syllables[cursors[verse_idx]].clone();
+            let next_continues = line
+                .syllables
+                .get(cursors[verse_idx] + 1)
+                .map(|n| n.starts_with('-'))
+                .unwrap_or(false);
+            cursors[verse_idx] += 1;
+            if !s.trim().is_empty() {
+                out.push(((verse_idx + 1) as u32, s, next_continues));
+            }
+        }
+    }
+    out
 }
 
 fn write_chord<W: Write>(
     w: &mut Writer<W>,
     c: &nwc_model::Chord,
     divisions: u32,
+    lyrics: &[(u32, String, bool)],
 ) -> Result<(), WriteError> {
     for (i, n) in c.notes.iter().enumerate() {
-        write_note(w, n, divisions, i > 0)?;
+        let l: &[(u32, String, bool)] = if i == 0 { lyrics } else { &[] };
+        write_note(w, n, divisions, i > 0, l)?;
     }
+    Ok(())
+}
+
+fn write_left_repeat<W: Write>(w: &mut Writer<W>) -> Result<(), WriteError> {
+    let mut bl = BytesStart::new("barline");
+    bl.push_attribute(("location", "left"));
+    w.write_event(Event::Start(bl)).map_err(xml_err)?;
+    write_text_element(w, "bar-style", "heavy-light")?;
+    let mut rep = BytesStart::new("repeat");
+    rep.push_attribute(("direction", "forward"));
+    w.write_event(Event::Empty(rep)).map_err(xml_err)?;
+    w.write_event(Event::End(BytesEnd::new("barline"))).map_err(xml_err)?;
+    Ok(())
+}
+
+fn write_closing_bar<W: Write>(
+    w: &mut Writer<W>,
+    bar: &StaffObject,
+) -> Result<(), WriteError> {
+    let (bar_style, repeat) = match bar {
+        StaffObject::Bar(b) => (
+            match b.style {
+                BarStyle::Single => None,
+                BarStyle::Double => Some("light-light"),
+                BarStyle::Final => Some("light-heavy"),
+                BarStyle::Heavy => Some("heavy"),
+            },
+            None,
+        ),
+        StaffObject::RepeatClose { .. } => (Some("light-heavy"), Some("backward")),
+        StaffObject::RepeatOpen => (Some("heavy-light"), Some("forward")),
+        _ => return Ok(()),
+    };
+    if bar_style.is_none() && repeat.is_none() {
+        return Ok(());
+    }
+    let mut bl = BytesStart::new("barline");
+    bl.push_attribute(("location", "right"));
+    w.write_event(Event::Start(bl)).map_err(xml_err)?;
+    if let Some(s) = bar_style {
+        write_text_element(w, "bar-style", s)?;
+    }
+    if let Some(dir) = repeat {
+        let mut rep = BytesStart::new("repeat");
+        rep.push_attribute(("direction", dir));
+        w.write_event(Event::Empty(rep)).map_err(xml_err)?;
+    }
+    w.write_event(Event::End(BytesEnd::new("barline"))).map_err(xml_err)?;
     Ok(())
 }
 
