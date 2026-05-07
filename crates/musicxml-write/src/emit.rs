@@ -192,6 +192,11 @@ fn write_part<W: Write>(w: &mut Writer<W>, staff: &Staff, idx: usize) -> Result<
                 &clef,
                 &key,
                 time.as_ref(),
+                if !emitted_initial_attributes {
+                    Some(staff.transposition)
+                } else {
+                    None
+                },
             )?;
             current_clef = Some(clef);
             current_key = Some(key);
@@ -243,6 +248,7 @@ fn write_part<W: Write>(w: &mut Writer<W>, staff: &Staff, idx: usize) -> Result<
             &Clef { kind: ClefKind::Treble, octave_shift: 0 },
             &KeySignature::default(),
             None,
+            None,
         )?;
         w.write_event(Event::End(BytesEnd::new("measure"))).map_err(xml_err)?;
     }
@@ -260,6 +266,7 @@ fn write_attributes<W: Write>(
     clef: &Clef,
     key: &KeySignature,
     time: Option<&TimeSignature>,
+    transposition_semitones: Option<i8>,
 ) -> Result<(), WriteError> {
     w.write_event(Event::Start(BytesStart::new("attributes")))
         .map_err(xml_err)?;
@@ -305,7 +312,33 @@ fn write_attributes<W: Write>(
         }
         w.write_event(Event::End(BytesEnd::new("clef"))).map_err(xml_err)?;
     }
+    if let Some(semis) = transposition_semitones {
+        if semis != 0 {
+            write_transpose(w, semis)?;
+        }
+    }
     w.write_event(Event::End(BytesEnd::new("attributes"))).map_err(xml_err)?;
+    Ok(())
+}
+
+/// Emit a `<transpose>` element for an instrument that sounds N semitones
+/// away from its written pitch. Negative N = sounds lower than written
+/// (the usual case for transposing instruments like Bb trumpet, F horn).
+/// Diatonic step count is approximated as `chromatic * 7 / 12` rounded
+/// toward zero — the standard transposing intervals (Bb=−2/-1, Eb=−9/-5,
+/// F=−7/-4, A=−3/-2) all come out correct.
+fn write_transpose<W: Write>(w: &mut Writer<W>, chromatic: i8) -> Result<(), WriteError> {
+    let chromatic_i = chromatic as i32;
+    let octave_change = chromatic_i / 12;
+    let chromatic_in_octave = chromatic_i - octave_change * 12;
+    let diatonic = chromatic_i * 7 / 12;
+    w.write_event(Event::Start(BytesStart::new("transpose"))).map_err(xml_err)?;
+    write_text_element(w, "diatonic", &diatonic.to_string())?;
+    write_text_element(w, "chromatic", &chromatic_in_octave.to_string())?;
+    if octave_change != 0 {
+        write_text_element(w, "octave-change", &octave_change.to_string())?;
+    }
+    w.write_event(Event::End(BytesEnd::new("transpose"))).map_err(xml_err)?;
     Ok(())
 }
 
