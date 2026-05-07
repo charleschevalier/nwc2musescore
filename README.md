@@ -22,6 +22,20 @@ cargo run -p nwc2musescore-cli -- input.nwc -o output.musicxml
 - `musicxml-write` — MusicXML 4.0 partwise emitter.
 - `nwc2musescore-cli` — command-line driver.
 
+## Validation
+
+Generated MusicXML can be validated against the official MusicXML 4.0 XSD with
+`xmllint`:
+
+```sh
+./scripts/fetch-schema.sh   # one-time, downloads to ./schema/ (gitignored)
+xmllint --noout --nonet --schema schema/musicxml-4.0/musicxml.xsd output.musicxml
+```
+
+The `xsd_validate` integration test under `crates/nwc2musescore-cli/tests/`
+runs this automatically when both `xmllint` and the schema files are
+present (it prints "skipping" otherwise so CI without those still passes).
+
 ## License
 
 Dual-licensed under MIT or Apache-2.0, at your option.

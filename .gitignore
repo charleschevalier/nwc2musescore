@@ -15,3 +15,7 @@ Cargo.lock.bak
 # Editor
 .idea/
 .vscode/
+
+# Schema files fetched by scripts/fetch-schema.sh (W3C / MusicXML CG, freely
+# available — not redistributed here).
+/schema/
