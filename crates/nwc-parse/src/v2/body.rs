@@ -148,7 +148,9 @@ pub fn parse_body(
                     scan_to_next_staff(body, resume_pos)
                 {
                     staves.push(make_empty_staff(s_idx, &name, &group));
-                    let _ = cur.skip(after - cur.pos(), "scan_to_next_staff");
+                    if after > cur.pos() {
+                        let _ = cur.skip(after - cur.pos(), "scan_to_next_staff");
+                    }
                 } else {
                     staves.push(make_empty_staff(s_idx, "", "Standard"));
                     break;
@@ -240,16 +242,45 @@ fn parse_staff(
     let label = String::new();
     let instrument_name = String::new();
 
-    // For NWC 2.01, the per-staff metadata block is 44 opaque bytes
-    // (verified against the corpus by counting back from the
-    // `numberOfObjects` u16 field). Individual fields (lines, transposition,
-    // MIDI program) are not yet decoded; M2's #9 task will pick those up.
-    // Music21 documents an unpacked layout starting with `skipBytes(27)`
-    // followed by `lines u8 + layerWithNextStaff u16 + ...`, but the
-    // offsets it uses don't match real 2.01 files.
-    cur.skip(44, "staff_metadata_opaque_v201")?;
-    let transposition: i16 = 0;
-    let lyrics: Vec<LyricLine> = Vec::new();
+    // Per-staff metadata for NWC 2.01. Music21 documents a 27-byte opaque
+    // prefix before `lines u8`; empirically that offset is 18 in 2.01 files
+    // (the `lines = 5` value lands there for a standard 5-line staff). The
+    // remaining field positions then line up with music21.
+    cur.skip(18, "staff_opaque_v201")?;
+    let _lines = cur.read_u8("lines")?;
+    let _layer_with_next = cur.read_u16_le("layerWithNextStaff")?;
+    let transposition = cur.read_u16_le("transposition")? as i16;
+    let _part_volume = cur.read_u16_le("partVolume")?;
+    let _stereo_pan = cur.read_u16_le("stereoPan")?;
+    let _color = cur.read_u8("color")?;
+    let _align_syllable = cur.read_u16_le("alignSyllable")?;
+    let number_of_lyrics = cur.read_u16_le("numberOfLyrics")?;
+    if number_of_lyrics > 0 {
+        let _lyric_alignment = cur.read_u16_le("lyricAlignment")?;
+        let _staff_offset = cur.read_u16_le("staffOffset")?;
+    }
+    let lyrics: Vec<LyricLine> = if number_of_lyrics == 0 {
+        Vec::new()
+    } else {
+        // Lyric block format still needs corpus validation; skip for now.
+        report.push(
+            Severity::Info,
+            cur.pos(),
+            format!(
+                "staff #{s_idx}: {number_of_lyrics} lyric verses present but not yet decoded"
+            ),
+        );
+        Vec::new()
+    };
+    if number_of_lyrics > 0 {
+        // Without decoding lyric blocks, we cannot advance past them. Bail
+        // and let the outer fallback scan recover.
+        return Err(NwcError::Malformed {
+            offset: cur.pos(),
+            message: "lyric-bearing staff: lyric block decoding TODO".into(),
+        });
+    }
+    let _ = cur.read_u16_le("staff junk")?;
 
     let raw_object_count = cur.read_u16_le("numberOfObjects")?;
     // music21 says: subtract 2 for v>150. Treat the count as an i32 to avoid
