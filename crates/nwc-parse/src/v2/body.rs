@@ -100,8 +100,16 @@ pub fn parse_body(
     cur.skip(36, "page_setup_tail")?;
     let _font_slots = cur.read_u16_le("font_slots")?;
 
-    // 12 fonts: cstr name + 4 trailing bytes (style, size, unused, charset).
-    let font_count = 12usize;
+    // Font count depends on the *compatibility version* music21 derives from
+    // the product byte (it reads `product:version_low` as a u16 and looks
+    // it up in a hex→version table). For our corpus:
+    //   product 0x4B + version_low 0x01 → 0x014B → v1.75 → 12 fonts
+    //   product 0x46 + version_low 0x01 → 0x0146 → v1.70 → 10 fonts
+    let font_count: usize = match header.product {
+        0x4B => 12,
+        0x46 => 10,
+        _ => 12,
+    };
     let mut fonts = Vec::with_capacity(font_count);
     for _ in 0..font_count {
         let name = cur.read_cstr_lossy("font_name")?;
@@ -237,50 +245,52 @@ fn parse_staff(
     s_idx: usize,
     report: &mut ConversionReport,
 ) -> Result<Staff, NwcError> {
+    // The structured per-staff layout we know is the music21 "v1.75" path,
+    // which corresponds to product byte 0x4B in v2.01 files. For other
+    // product bytes (e.g. 0x46) music21 itself falls through and produces
+    // garbage, so we bail out and let the scanner fallback recover.
+    if header.product != 0x4B {
+        return Err(NwcError::UnsupportedVersion {
+            major: header.version.major,
+            minor: header.version.minor,
+        });
+    }
+
     let name = cur.read_cstr_lossy("staff_name")?;
     let group = cur.read_cstr_lossy("staff_group")?;
     let label = String::new();
     let instrument_name = String::new();
 
-    // Per-staff metadata for NWC 2.01. Music21 documents a 27-byte opaque
-    // prefix before `lines u8`; empirically that offset is 18 in 2.01 files
-    // (the `lines = 5` value lands there for a standard 5-line staff). The
-    // remaining field positions then line up with music21.
-    cur.skip(18, "staff_opaque_v201")?;
-    let _lines = cur.read_u8("lines")?;
-    let _layer_with_next = cur.read_u16_le("layerWithNextStaff")?;
-    let transposition = cur.read_u16_le("transposition")? as i16;
-    let _part_volume = cur.read_u16_le("partVolume")?;
-    let _stereo_pan = cur.read_u16_le("stereoPan")?;
-    let _color = cur.read_u8("color")?;
+    // Per-staff metadata layout (v2.01 + product 0x4B == music21's "v175"):
+    //   11 bytes opaque
+    //   u8  midi_program (0..127)
+    //   10 bytes opaque
+    //   i8  transposition (signed semitones)
+    //   6 bytes opaque
+    //   u16 align_syllable
+    //   u16 number_of_lyrics
+    cur.skip(11, "staff opaque #1")?;
+    let midi_program = cur.read_u8("midi_program")?;
+    cur.skip(10, "staff opaque #2")?;
+    let transposition = cur.read_i8("transposition")? as i16;
+    cur.skip(6, "staff opaque #3")?;
     let _align_syllable = cur.read_u16_le("alignSyllable")?;
     let number_of_lyrics = cur.read_u16_le("numberOfLyrics")?;
+
     if number_of_lyrics > 0 {
         let _lyric_alignment = cur.read_u16_le("lyricAlignment")?;
         let _staff_offset = cur.read_u16_le("staffOffset")?;
     }
-    let lyrics: Vec<LyricLine> = if number_of_lyrics == 0 {
-        Vec::new()
-    } else {
-        // Lyric block format still needs corpus validation; skip for now.
-        report.push(
-            Severity::Info,
-            cur.pos(),
-            format!(
-                "staff #{s_idx}: {number_of_lyrics} lyric verses present but not yet decoded"
-            ),
-        );
-        Vec::new()
-    };
+
+    let lyrics = parse_lyrics_block(cur, number_of_lyrics, report, s_idx)?;
+
+    // After lyrics, music21 reads:
+    //   if numberOfLyrics > 0: u16 junk
+    //   u16 junk_2
     if number_of_lyrics > 0 {
-        // Without decoding lyric blocks, we cannot advance past them. Bail
-        // and let the outer fallback scan recover.
-        return Err(NwcError::Malformed {
-            offset: cur.pos(),
-            message: "lyric-bearing staff: lyric block decoding TODO".into(),
-        });
+        let _ = cur.read_u16_le("post-lyrics junk")?;
     }
-    let _ = cur.read_u16_le("staff junk")?;
+    let _ = cur.read_u16_le("staff junk_2")?;
 
     let raw_object_count = cur.read_u16_le("numberOfObjects")?;
     // music21 says: subtract 2 for v>150. Treat the count as an i32 to avoid
@@ -298,8 +308,9 @@ fn parse_staff(
     let object_count = object_count.max(0) as usize;
 
     let mut objects = Vec::with_capacity(object_count);
+    let mut current_clef = ClefKind::Treble;
     for i in 0..object_count {
-        let obj = parse_object(cur, header, report).map_err(|e| {
+        let obj = parse_object(cur, header, report, &mut current_clef).map_err(|e| {
             NwcError::Malformed {
                 offset: cur.pos(),
                 message: format!(
@@ -318,6 +329,13 @@ fn parse_staff(
         format!("Staff {}", s_idx + 1)
     };
 
+    let instrument_name_resolved =
+        if !instrument_name.is_empty() {
+            Some(instrument_name)
+        } else {
+            midi_program_to_name(midi_program).map(|s| s.to_string())
+        };
+
     Ok(Staff {
         name: display_name.clone(),
         label: Some(display_name),
@@ -328,13 +346,9 @@ fn parse_staff(
             Some(group)
         },
         instrument: Instrument {
-            midi_program: None,
+            midi_program: Some(midi_program),
             midi_channel: None,
-            name: if instrument_name.is_empty() {
-                None
-            } else {
-                Some(instrument_name)
-            },
+            name: instrument_name_resolved,
         },
         transposition: transposition.clamp(i8::MIN as i16, i8::MAX as i16) as i8,
         lyrics,
@@ -342,24 +356,45 @@ fn parse_staff(
     })
 }
 
-#[allow(dead_code)]
-fn parse_lyrics(cur: &mut Cursor<'_>, n_verses: u16) -> Result<Vec<LyricLine>, NwcError> {
+/// Parse `n_verses` lyric blocks following the music21 v1.75 flow:
+/// each verse begins with a `lyricBlockSize` u16 and (if non-zero) a
+/// `unused_lyricSize` u16 + `junk` u16 + one or more null-terminated
+/// syllables. The cursor is realigned to `block_start + lyricBlockSize`
+/// after each verse so we don't drift even if syllable parsing is wrong.
+fn parse_lyrics_block(
+    cur: &mut Cursor<'_>,
+    n_verses: u16,
+    report: &mut ConversionReport,
+    s_idx: usize,
+) -> Result<Vec<LyricLine>, NwcError> {
     let mut out = Vec::with_capacity(n_verses as usize);
-    for _ in 0..n_verses {
+    for _verse in 0..n_verses {
         let block_size = cur.read_u16_le("lyricBlockSize")? as usize;
         if block_size == 0 {
             out.push(LyricLine::default());
             continue;
         }
+        let _unused_size = cur.read_u16_le("unused_lyricSize")?;
         let block_start = cur.pos();
-        let _ = cur.read_u16_le("unused_lyricSize")?;
-        let _ = cur.read_u16_le("junk")?;
+        let target = block_start + block_size;
+        if target > cur.remaining() + cur.pos() {
+            report.push(
+                Severity::Warn,
+                cur.pos(),
+                format!(
+                    "staff #{s_idx}: lyric block size {block_size} exceeds remaining bytes; truncating"
+                ),
+            );
+            return Err(NwcError::UnexpectedEof {
+                offset: cur.pos(),
+                context: "lyric block",
+            });
+        }
+        let _ = cur.read_u16_le("lyric junk")?;
         let mut text = String::new();
-        let max_iter = 1024;
-        for _ in 0..max_iter {
-            if cur.pos() >= block_start + block_size {
-                break;
-            }
+        let mut iter = 0usize;
+        while cur.pos() < target && iter < 1000 {
+            iter += 1;
             let s = cur.read_cstr_lossy("lyric_syllable")?;
             if s.is_empty() {
                 break;
@@ -369,8 +404,6 @@ fn parse_lyrics(cur: &mut Cursor<'_>, n_verses: u16) -> Result<Vec<LyricLine>, N
             }
             text.push_str(&s);
         }
-        // Realign cursor exactly to block_start + block_size.
-        let target = block_start + block_size;
         if cur.pos() < target {
             cur.skip(target - cur.pos(), "lyric tail")?;
         }
@@ -379,10 +412,54 @@ fn parse_lyrics(cur: &mut Cursor<'_>, n_verses: u16) -> Result<Vec<LyricLine>, N
     Ok(out)
 }
 
+/// Standard MIDI Level 1 program names. NWC's per-staff `midi_program`
+/// field is a 1-based MIDI program (1..128); music21 subtracts 1 to index
+/// into a 0-based list. We do the same.
+fn midi_program_to_name(p: u8) -> Option<&'static str> {
+    if p == 0 {
+        return None;
+    }
+    let idx = (p - 1) as usize;
+    MIDI_INSTRUMENTS.get(idx).copied()
+}
+
+const MIDI_INSTRUMENTS: &[&str] = &[
+    "Acoustic Grand Piano", "Bright Acoustic Piano", "Electric Grand Piano",
+    "Honky-tonk Piano", "Electric Piano 1", "Electric Piano 2", "Harpsichord",
+    "Clavinet", "Celesta", "Glockenspiel", "Music Box", "Vibraphone",
+    "Marimba", "Xylophone", "Tubular Bells", "Dulcimer", "Drawbar Organ",
+    "Percussive Organ", "Rock Organ", "Church Organ", "Reed Organ",
+    "Accordion", "Harmonica", "Tango Accordion", "Acoustic Guitar (nylon)",
+    "Acoustic Guitar (steel)", "Electric Guitar (jazz)", "Electric Guitar (clean)",
+    "Electric Guitar (muted)", "Overdriven Guitar", "Distortion Guitar",
+    "Guitar harmonics", "Acoustic Bass", "Electric Bass (finger)",
+    "Electric Bass (pick)", "Fretless Bass", "Slap Bass 1", "Slap Bass 2",
+    "Synth Bass 1", "Synth Bass 2", "Violin", "Viola", "Cello", "Contrabass",
+    "Tremolo Strings", "Pizzicato Strings", "Orchestral Harp", "Timpani",
+    "String Ensemble 1", "String Ensemble 2", "SynthStrings 1", "SynthStrings 2",
+    "Choir Aahs", "Voice Oohs", "Synth Voice", "Orchestra Hit", "Trumpet",
+    "Trombone", "Tuba", "Muted Trumpet", "French Horn", "Brass Section",
+    "SynthBrass 1", "SynthBrass 2", "Soprano Sax", "Alto Sax", "Tenor Sax",
+    "Baritone Sax", "Oboe", "English Horn", "Bassoon", "Clarinet", "Piccolo",
+    "Flute", "Recorder", "Pan Flute", "Blown Bottle", "Shakuhachi", "Whistle",
+    "Ocarina", "Lead 1 (square)", "Lead 2 (sawtooth)", "Lead 3 (calliope)",
+    "Lead 4 (chiff)", "Lead 5 (charang)", "Lead 6 (voice)", "Lead 7 (fifths)",
+    "Lead 8 (bass + lead)", "Pad 1 (new age)", "Pad 2 (warm)", "Pad 3 (polysynth)",
+    "Pad 4 (choir)", "Pad 5 (bowed)", "Pad 6 (metallic)", "Pad 7 (halo)",
+    "Pad 8 (sweep)", "FX 1 (rain)", "FX 2 (soundtrack)", "FX 3 (crystal)",
+    "FX 4 (atmosphere)", "FX 5 (brightness)", "FX 6 (goblins)", "FX 7 (echoes)",
+    "FX 8 (sci-fi)", "Sitar", "Banjo", "Shamisen", "Koto", "Kalimba",
+    "Bag pipe", "Fiddle", "Shanai", "Tinkle Bell", "Agogo", "Steel Drums",
+    "Woodblock", "Taiko Drum", "Melodic Tom", "Synth Drum", "Reverse Cymbal",
+    "Guitar Fret Noise", "Breath Noise", "Seashore", "Bird Tweet",
+    "Telephone Ring", "Helicopter", "Applause", "Gunshot",
+];
+
 fn parse_object(
     cur: &mut Cursor<'_>,
     header: &Header,
     report: &mut ConversionReport,
+    current_clef: &mut ClefKind,
 ) -> Result<StaffObject, NwcError> {
     let object_type = cur.read_u16_le("objectType")?;
     let _visible = if header.version.minor >= 70 || header.version.major >= 2 {
@@ -391,7 +468,13 @@ fn parse_object(
         0
     };
     match object_type {
-        0 => parse_clef(cur),
+        0 => {
+            let obj = parse_clef(cur)?;
+            if let StaffObject::Clef(c) = &obj {
+                *current_clef = c.kind;
+            }
+            Ok(obj)
+        }
         1 => parse_keysig(cur),
         2 => parse_barline(cur),
         3 => parse_ending(cur),
@@ -399,9 +482,9 @@ fn parse_object(
         5 => parse_timesig(cur),
         6 => parse_tempo(cur, header),
         7 => parse_dynamic(cur),
-        8 => parse_note(cur, header),
+        8 => parse_note(cur, header, *current_clef),
         9 => parse_rest(cur, header),
-        10 => parse_chord(cur, header, report),
+        10 => parse_chord(cur, header, report, current_clef),
         11 => parse_pedal(cur, report),
         12 => parse_flow(cur, header, report),
         13 => parse_mpc(cur, header, report),
@@ -409,7 +492,7 @@ fn parse_object(
         15 => parse_dynamic_variation(cur, header, report),
         16 => parse_performance(cur, header, report),
         17 => parse_text(cur, report),
-        18 => parse_rest_chord(cur, header, report),
+        18 => parse_rest_chord(cur, header, report, current_clef),
         other => {
             // Unknown object type. We can't safely recover without knowing the
             // size, so bail.
@@ -516,21 +599,12 @@ fn parse_tempo(
     let _pos = cur.read_u8("tempo pos")?;
     let _placement = cur.read_u8("tempo placement")?;
     let value = cur.read_u16_le("tempo bpm")?;
-    let base = cur.read_u8("tempo base")?;
+    let base_byte = cur.read_u8("tempo base")?;
     if header.version.major < 2 && header.version.minor < 70 {
         let _ = cur.read_u16_le("tempo legacy junk")?;
     }
     let text = cur.read_cstr_lossy("tempo text")?;
-    let base = match base {
-        0 => NoteValue::Whole,
-        1 => NoteValue::Half,
-        2 => NoteValue::Quarter,
-        3 => NoteValue::Eighth,
-        4 => NoteValue::Sixteenth,
-        5 => NoteValue::ThirtySecond,
-        6 => NoteValue::SixtyFourth,
-        _ => NoteValue::Quarter,
-    };
+    let base = duration_byte_to_value(base_byte);
     Ok(StaffObject::Tempo(nwc_model::Tempo {
         bpm: value,
         base,
@@ -560,7 +634,27 @@ fn parse_dynamic(cur: &mut Cursor<'_>) -> Result<StaffObject, NwcError> {
     Ok(StaffObject::Dynamic(dyn_kind))
 }
 
-fn parse_note(cur: &mut Cursor<'_>, header: &Header) -> Result<StaffObject, NwcError> {
+/// NWC's note duration byte → NoteValue. Mirrors music21's
+/// `constants.DurationValues` table: 0=Whole, 1=Half, 2=Quarter,
+/// 3=Eighth, 4=16th, 5=32nd, 6=64th.
+fn duration_byte_to_value(b: u8) -> NoteValue {
+    match b {
+        0 => NoteValue::Whole,
+        1 => NoteValue::Half,
+        2 => NoteValue::Quarter,
+        3 => NoteValue::Eighth,
+        4 => NoteValue::Sixteenth,
+        5 => NoteValue::ThirtySecond,
+        6 => NoteValue::SixtyFourth,
+        _ => NoteValue::Quarter,
+    }
+}
+
+fn parse_note(
+    cur: &mut Cursor<'_>,
+    header: &Header,
+    current_clef: ClefKind,
+) -> Result<StaffObject, NwcError> {
     let _ = header;
     let duration_byte = cur.read_u8("note duration")?;
     let data2 = [
@@ -575,27 +669,14 @@ fn parse_note(cur: &mut Cursor<'_>, header: &Header) -> Result<StaffObject, NwcE
     let pos_signed = cur.read_i8("note pos")? as i16;
     let pos = -pos_signed; // music21 negates
     let attribute2 = cur.read_u8("note attr2")?;
-    if header.version.major >= 2 && (attribute2 & 0x40) != 0 {
-        let _stem_length = cur.read_u8("note stemLength")?;
-    }
+    // NWC 2.01 files use the v1.75 layout (no stemLength byte even when
+    // attribute2 & 0x40 is set; music21's "v>=200 might have stemLength"
+    // branch only kicks in for later v2.x point releases).
 
-    // Build pitch from staff position. NWC stores pitch as a staff-line
-    // offset; we map it to (step, octave) under a treble-clef assumption
-    // here. Real clef-aware mapping requires writer-side context (M3 work).
-    let pitch = staff_pos_to_pitch(pos, attribute2);
+    // Build pitch from staff position using the clef in scope.
+    let pitch = staff_pos_to_pitch(pos, attribute2, current_clef);
 
-    // Duration value table (music21):
-    // 0=64th, 1=32nd, 2=16th, 3=Eighth, 4=Quarter, 5=Half, 6=Whole
-    let base = match duration_byte {
-        0 => NoteValue::SixtyFourth,
-        1 => NoteValue::ThirtySecond,
-        2 => NoteValue::Sixteenth,
-        3 => NoteValue::Eighth,
-        4 => NoteValue::Quarter,
-        5 => NoteValue::Half,
-        6 => NoteValue::Whole,
-        _ => NoteValue::Quarter,
-    };
+    let base = duration_byte_to_value(duration_byte);
     let dot_attr = attribute1[0];
     let dots = if (dot_attr & 0x01) > 0 {
         2
@@ -644,16 +725,7 @@ fn parse_rest(cur: &mut Cursor<'_>, header: &Header) -> Result<StaffObject, NwcE
         cur.read_u8("rest data2[4]")?,
     ];
     let _offset = cur.read_u16_le("rest offset")?;
-    let base = match duration_byte {
-        0 => NoteValue::SixtyFourth,
-        1 => NoteValue::ThirtySecond,
-        2 => NoteValue::Sixteenth,
-        3 => NoteValue::Eighth,
-        4 => NoteValue::Quarter,
-        5 => NoteValue::Half,
-        6 => NoteValue::Whole,
-        _ => NoteValue::Quarter,
-    };
+    let base = duration_byte_to_value(duration_byte);
     let dots = if (data2[3] & 0x01) > 0 {
         2
     } else if (data2[3] & 0x04) > 0 {
@@ -676,15 +748,22 @@ fn parse_rest(cur: &mut Cursor<'_>, header: &Header) -> Result<StaffObject, NwcE
 fn parse_chord(
     cur: &mut Cursor<'_>,
     header: &Header,
-    _report: &mut ConversionReport,
+    report: &mut ConversionReport,
+    current_clef: &mut ClefKind,
 ) -> Result<StaffObject, NwcError> {
-    // Skip the chord header bytes (8 for v>=200) plus an optional stem length.
-    cur.skip(8, "chord data1")?;
-    if header.version.major >= 2 {
-        // music21 reads attribute byte 7, checks 0x40 to know if stemLength
-        // follows — but we already skipped 8 bytes including that byte. To
-        // remain compatible with that branch, we don't read more here. M3
-        // can refine.
+    // music21's v=175 path: 10 bytes of header data, with numberOfNotes
+    // at data1[8]. Then N more chord notes each parsed as a full NWCObject.
+    let mut data1 = [0u8; 10];
+    for slot in data1.iter_mut() {
+        *slot = cur.read_u8("chord data1")?;
+    }
+    let number_of_notes = data1[8] as usize;
+    let _ = data1; // keep for potential future use
+    for _ in 0..number_of_notes {
+        // Recurse: each chord note is itself a full object record. Discard
+        // the result for now; chords are not yet round-tripped to the
+        // writer (M3 will revisit).
+        let _ = parse_object(cur, header, report, current_clef)?;
     }
     Ok(StaffObject::User(UserObject {
         type_byte: 10,
@@ -695,10 +774,20 @@ fn parse_chord(
 
 fn parse_rest_chord(
     cur: &mut Cursor<'_>,
-    _header: &Header,
-    _report: &mut ConversionReport,
+    header: &Header,
+    report: &mut ConversionReport,
+    current_clef: &mut ClefKind,
 ) -> Result<StaffObject, NwcError> {
-    cur.skip(10, "rest chord")?;
+    // music21's restChordMember() calls noteChordMember(): same 10 bytes of
+    // data1 plus N more chord-note objects parsed inline.
+    let mut data1 = [0u8; 10];
+    for slot in data1.iter_mut() {
+        *slot = cur.read_u8("rest chord data1")?;
+    }
+    let number_of_notes = data1[8] as usize;
+    for _ in 0..number_of_notes {
+        let _ = parse_object(cur, header, report, current_clef)?;
+    }
     Ok(StaffObject::User(UserObject {
         type_byte: 18,
         tag: Some("RestChordMember".into()),
@@ -742,19 +831,13 @@ fn parse_flow(
 
 fn parse_mpc(
     cur: &mut Cursor<'_>,
-    header: &Header,
+    _header: &Header,
     _report: &mut ConversionReport,
 ) -> Result<StaffObject, NwcError> {
     let _pos = cur.read_u8("mpc pos")?;
     let _placement = cur.read_u8("mpc placement")?;
-    let payload_len = if header.version.major >= 2 {
-        31
-    } else if header.version.minor >= 55 {
-        31
-    } else {
-        32
-    };
-    cur.skip(payload_len, "mpc payload")?;
+    // v=175 layout (matches our v2.01 files): 32-byte payload.
+    cur.skip(32, "mpc payload")?;
     Ok(StaffObject::User(UserObject {
         type_byte: 13,
         tag: Some("MPC".into()),
@@ -841,14 +924,23 @@ fn style_flags_to_string(style: u8) -> String {
 }
 
 /// Map an NWC staff position (positive = above middle line, negative = below)
-/// to a pitch under a treble-clef assumption. NWC's staff position 0 is the
-/// middle line of a 5-line staff (B4 on treble clef).
-fn staff_pos_to_pitch(pos: i16, attribute2: u8) -> Pitch {
-    // Treble clef: middle line = B4 (step B, octave 4, diatonic index 6).
-    // Step diatonic offset from C0:
-    //   C0 -> 0, D0 -> 1, ... B0 -> 6, C1 -> 7, ...
-    // B4's diatonic index is 4*7 + 6 = 34.
-    let middle_diatonic_index: i32 = 34;
+/// to a pitch using the clef in scope. NWC's pos=0 is the middle line of
+/// a 5-line staff. Each clef has a different middle-line pitch:
+///   Treble:    B4
+///   Bass:      D3
+///   Alto:      C4
+///   Tenor:     A3
+///   Percussion (1-line): treated as C4 placeholder.
+fn staff_pos_to_pitch(pos: i16, attribute2: u8, clef: ClefKind) -> Pitch {
+    let middle_diatonic_index: i32 = match clef {
+        // C0=0, B0=6, C1=7, …; B4 = 4*7+6 = 34, D3 = 3*7+1 = 22,
+        // C4 = 4*7+0 = 28, A3 = 3*7+5 = 26.
+        ClefKind::Treble => 34,
+        ClefKind::Bass => 22,
+        ClefKind::Alto => 28,
+        ClefKind::Tenor => 26,
+        ClefKind::Percussion => 28,
+    };
     let diatonic_index = middle_diatonic_index + pos as i32;
     let octave = ((diatonic_index).div_euclid(7)) as i8;
     let step_idx = (diatonic_index).rem_euclid(7) as u8;
