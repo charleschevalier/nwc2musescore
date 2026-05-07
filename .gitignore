@@ -1,0 +1,17 @@
+/target
+Cargo.lock.bak
+*.swp
+.DS_Store
+
+# Test corpus from third-party sources is not committed.
+# Curated public-domain samples should live under corpus/curated/.
+/corpus/*
+!/corpus/curated/
+!/corpus/MANIFEST.md
+
+# Snapshot review files
+*.snap.new
+
+# Editor
+.idea/
+.vscode/

@@ -1,0 +1,13 @@
+[package]
+name = "musicxml-write"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Emit MusicXML 4.0 partwise from a nwc-model Score."
+
+[dependencies]
+nwc-model.workspace = true
+thiserror.workspace = true
+quick-xml.workspace = true

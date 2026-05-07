@@ -1,0 +1,23 @@
+[package]
+name = "nwc2musescore-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Convert NoteWorthy Composer .nwc / .nwz files to MusicXML."
+
+[[bin]]
+name = "nwc2musescore"
+path = "src/main.rs"
+
+[dependencies]
+nwc-parse.workspace = true
+musicxml-write.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+flate2.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "nwc-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Format-version-agnostic domain model for NoteWorthy Composer scores."
+
+[dependencies]
+thiserror.workspace = true

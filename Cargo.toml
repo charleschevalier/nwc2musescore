@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nwc-model",
+    "crates/nwc-parse",
+    "crates/musicxml-write",
+    "crates/nwc2musescore-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/charles-/nwc2musescore"
+
+[workspace.dependencies]
+nwc-model = { path = "crates/nwc-model" }
+nwc-parse = { path = "crates/nwc-parse" }
+musicxml-write = { path = "crates/musicxml-write" }
+
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+byteorder = "1"
+flate2 = "1"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+encoding_rs = "0.8"
+quick-xml = "0.31"
+clap = { version = "4", features = ["derive"] }
+insta = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

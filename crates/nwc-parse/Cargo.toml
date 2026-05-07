@@ -1,0 +1,17 @@
+[package]
+name = "nwc-parse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Decoder for NoteWorthy Composer (.nwc / .nwz) binary score files."
+
+[dependencies]
+nwc-model.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+byteorder.workspace = true
+flate2.workspace = true
+zip.workspace = true
+encoding_rs.workspace = true
