@@ -100,16 +100,12 @@ pub fn parse_body(
     cur.skip(36, "page_setup_tail")?;
     let _font_slots = cur.read_u16_le("font_slots")?;
 
-    // Font count depends on the *compatibility version* music21 derives from
-    // the product byte (it reads `product:version_low` as a u16 and looks
-    // it up in a hex→version table). For our corpus:
-    //   product 0x4B + version_low 0x01 → 0x014B → v1.75 → 12 fonts
-    //   product 0x46 + version_low 0x01 → 0x0146 → v1.70 → 10 fonts
-    let font_count: usize = match header.product {
-        0x4B => 12,
-        0x46 => 10,
-        _ => 12,
-    };
+    // Font count: 12 for both product variants (0x46 and 0x4B). Music21's
+    // table thinks 0x46 → v1.70 → 10 fonts, but byte-level inspection of
+    // 0x46-product corpus files (e.g. Ska boys) shows 12 fonts followed
+    // by the staff prelude, same as 0x4B files.
+    let _ = header.product;
+    let font_count: usize = 12;
     let mut fonts = Vec::with_capacity(font_count);
     for _ in 0..font_count {
         let name = cur.read_cstr_lossy("font_name")?;
@@ -245,17 +241,6 @@ fn parse_staff(
     s_idx: usize,
     report: &mut ConversionReport,
 ) -> Result<Staff, NwcError> {
-    // The structured per-staff layout we know is the music21 "v1.75" path,
-    // which corresponds to product byte 0x4B in v2.01 files. For other
-    // product bytes (e.g. 0x46) music21 itself falls through and produces
-    // garbage, so we bail out and let the scanner fallback recover.
-    if header.product != 0x4B {
-        return Err(NwcError::UnsupportedVersion {
-            major: header.version.major,
-            minor: header.version.minor,
-        });
-    }
-
     let name = cur.read_cstr_lossy("staff_name")?;
     let group = cur.read_cstr_lossy("staff_group")?;
     let label = String::new();
@@ -634,6 +619,49 @@ fn parse_dynamic(cur: &mut Cursor<'_>) -> Result<StaffObject, NwcError> {
     Ok(StaffObject::Dynamic(dyn_kind))
 }
 
+/// Construct a Note model from the 8-byte payload (without the
+/// type-prefix u16 + visible u8). Used by the chord parser, which reads
+/// the 10-byte chord header and treats bytes 0..8 as the top note's
+/// payload.
+fn note_from_payload(p: &[u8], current_clef: ClefKind) -> nwc_model::Note {
+    let duration_byte = p[0];
+    let _data2 = [p[1], p[2], p[3]];
+    let attribute1 = [p[4], p[5]];
+    let pos_signed = p[6] as i8 as i16;
+    let pos = -pos_signed;
+    let attribute2 = p[7];
+    let pitch = staff_pos_to_pitch(pos, attribute2, current_clef);
+    let base = duration_byte_to_value(duration_byte);
+    let dot_attr = attribute1[0];
+    let dots = if (dot_attr & 0x01) > 0 {
+        2
+    } else if (dot_attr & 0x04) > 0 {
+        1
+    } else {
+        0
+    };
+    nwc_model::Note {
+        pitch,
+        duration: NwcDuration { base, dots, tuplet: None },
+        stem: nwc_model::StemDir::Auto,
+        beam: nwc_model::BeamState::None,
+        tie: if (attribute1[0] & 0x10) != 0 {
+            Some(nwc_model::TieDir::Start)
+        } else {
+            None
+        },
+        slur: None,
+        articulations: nwc_model::Articulations::default(),
+        ornaments: nwc_model::Ornaments::default(),
+        grace: false,
+        triplet: None,
+        voice: 1,
+        lyric_anchor: false,
+        velocity: None,
+        muted: false,
+    }
+}
+
 /// NWC's note duration byte → NoteValue. Mirrors music21's
 /// `constants.DurationValues` table: 0=Whole, 1=Half, 2=Quarter,
 /// 3=Eighth, 4=16th, 5=32nd, 6=64th.
@@ -751,24 +779,38 @@ fn parse_chord(
     report: &mut ConversionReport,
     current_clef: &mut ClefKind,
 ) -> Result<StaffObject, NwcError> {
-    // music21's v=175 path: 10 bytes of header data, with numberOfNotes
-    // at data1[8]. Then N more chord notes each parsed as a full NWCObject.
+    // music21's v=175 NoteChordMember layout:
+    //   data1: 10 bytes
+    //     [0..8] - same shape as a single Note's payload
+    //     [8]    - numberOfNotes (additional chord members)
+    //     [9]    - padding / unknown
+    //   data2: N additional Note objects (parsed inline, type-prefixed)
+    //
+    // We synthesise a top note from data1 and append the additional pos
+    // values from data2 to produce a Chord with N+1 voiced positions.
     let mut data1 = [0u8; 10];
     for slot in data1.iter_mut() {
         *slot = cur.read_u8("chord data1")?;
     }
     let number_of_notes = data1[8] as usize;
-    let _ = data1; // keep for potential future use
+
+    let base_note = note_from_payload(&data1[..8], *current_clef);
+
+    let mut chord_notes = Vec::with_capacity(number_of_notes + 1);
+    chord_notes.push(base_note.clone());
     for _ in 0..number_of_notes {
-        // Recurse: each chord note is itself a full object record. Discard
-        // the result for now; chords are not yet round-tripped to the
-        // writer (M3 will revisit).
-        let _ = parse_object(cur, header, report, current_clef)?;
+        let obj = parse_object(cur, header, report, current_clef)?;
+        if let StaffObject::Note(n) = obj {
+            chord_notes.push(n);
+        }
     }
-    Ok(StaffObject::User(UserObject {
-        type_byte: 10,
-        tag: Some("NoteChordMember".into()),
-        raw: Vec::new(),
+
+    Ok(StaffObject::Chord(nwc_model::Chord {
+        notes: chord_notes,
+        duration: base_note.duration,
+        stem: base_note.stem,
+        beam: base_note.beam,
+        voice: base_note.voice,
     }))
 }
 

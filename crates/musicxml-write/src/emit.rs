@@ -199,13 +199,12 @@ fn write_part<W: Write>(w: &mut Writer<W>, staff: &Staff, idx: usize) -> Result<
 
         for obj in musical_objects {
             match obj {
-                StaffObject::Note(n) => write_note(w, n, ctx.divisions)?,
+                StaffObject::Note(n) => write_note(w, n, ctx.divisions, false)?,
                 StaffObject::Rest(r) => write_rest(w, r, ctx.divisions)?,
-                StaffObject::Chord(_) => {
-                    // M1: stub. Chord rendering will arrive in M2.
-                }
+                StaffObject::Chord(c) => write_chord(w, c, ctx.divisions)?,
                 _ => {
-                    // M1 ignores other event kinds.
+                    // Other event kinds are dropped for now (Tempo,
+                    // Dynamic, Text, Flow, Bar, Ending, ...). M3 work.
                 }
             }
         }
@@ -294,8 +293,16 @@ fn write_attributes<W: Write>(
     Ok(())
 }
 
-fn write_note<W: Write>(w: &mut Writer<W>, n: &Note, divisions: u32) -> Result<(), WriteError> {
+fn write_note<W: Write>(
+    w: &mut Writer<W>,
+    n: &Note,
+    divisions: u32,
+    is_chord_member: bool,
+) -> Result<(), WriteError> {
     w.write_event(Event::Start(BytesStart::new("note"))).map_err(xml_err)?;
+    if is_chord_member {
+        w.write_event(Event::Empty(BytesStart::new("chord"))).map_err(xml_err)?;
+    }
     write_pitch(w, &n.pitch)?;
     write_text_element(w, "duration", &n.duration.in_divisions(divisions).to_string())?;
     let voice = n.voice.max(1);
@@ -308,6 +315,17 @@ fn write_note<W: Write>(w: &mut Writer<W>, n: &Note, divisions: u32) -> Result<(
         write_text_element(w, "accidental", accidental_name(acc))?;
     }
     w.write_event(Event::End(BytesEnd::new("note"))).map_err(xml_err)?;
+    Ok(())
+}
+
+fn write_chord<W: Write>(
+    w: &mut Writer<W>,
+    c: &nwc_model::Chord,
+    divisions: u32,
+) -> Result<(), WriteError> {
+    for (i, n) in c.notes.iter().enumerate() {
+        write_note(w, n, divisions, i > 0)?;
+    }
     Ok(())
 }
 
