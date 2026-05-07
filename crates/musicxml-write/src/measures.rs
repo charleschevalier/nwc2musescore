@@ -15,10 +15,6 @@ pub struct Measure<'a> {
 pub fn group(staff: &Staff) -> Vec<Measure<'_>> {
     let mut out: Vec<Measure<'_>> = Vec::new();
     let mut current = Measure::default();
-    let mut next_opens_repeat = false;
-    if next_opens_repeat {
-        current.opens_repeat = true;
-    }
     for obj in &staff.objects {
         match obj {
             StaffObject::Bar(_)
@@ -29,13 +25,11 @@ pub fn group(staff: &Staff) -> Vec<Measure<'_>> {
             StaffObject::RepeatOpen => {
                 // A repeat-open marker closes the current measure (if it
                 // already had any content) and the *next* measure opens
-                // with the forward repeat. Emit a closing bar so the
-                // measure isn't lost.
+                // with the forward repeat.
                 if !current.objects.is_empty() {
                     current.closing_bar = Some(obj);
                     out.push(std::mem::take(&mut current));
                 }
-                next_opens_repeat = true;
                 current.opens_repeat = true;
             }
             _ => current.objects.push(obj),
