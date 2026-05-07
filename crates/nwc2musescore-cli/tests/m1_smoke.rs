@@ -19,17 +19,18 @@ fn build_synthetic_nwc201(title: &str, author: &str) -> Vec<u8> {
     body.extend_from_slice(&[0x01, 0x02]); // version 0x0201
     body.extend_from_slice(&[0, 0, 0]); // padding
 
-    // score-info cstrs
-    body.extend_from_slice(author.as_bytes());
-    body.push(0);
-    body.push(0); // licence_tag (empty)
+    // score-info cstrs (NWC 2.01 layout):
+    //   user, unknown, [10 reserved], title, author, copyright1, copyright2, comment
+    body.push(0); // user (empty)
+    body.push(0); // unknown (empty)
     body.extend_from_slice(&[0u8; 10]); // 10 reserved bytes
     body.extend_from_slice(title.as_bytes());
     body.push(0);
-    body.push(0); // subtitle
+    body.extend_from_slice(author.as_bytes());
+    body.push(0);
     body.push(0); // copyright1
     body.push(0); // copyright2
-    body.push(0); // comments
+    body.push(0); // comment
 
     // page setup
     body.extend_from_slice(b"NY_\0");

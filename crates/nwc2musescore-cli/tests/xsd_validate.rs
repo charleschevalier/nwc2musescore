@@ -46,14 +46,14 @@ fn build_synthetic_nwc201_with_one_staff() -> Vec<u8> {
     body.push(0x4B);
     body.extend_from_slice(&[0x01, 0x02]);
     body.extend_from_slice(&[0, 0, 0]);
-    body.extend_from_slice(b"Test\0"); // author
-    body.push(0); // licence_tag
+    body.push(0); // user (empty)
+    body.push(0); // unknown (empty)
     body.extend_from_slice(&[0u8; 10]);
     body.extend_from_slice(b"Hello\0"); // title
-    body.push(0); // subtitle
+    body.push(0); // author (empty)
     body.push(0); // copyright1
     body.push(0); // copyright2
-    body.push(0); // comments
+    body.push(0); // comment
     body.extend_from_slice(b"NY_\0F2\0");
     body.extend_from_slice(&[0, 0, 0, 0]);
     body.extend_from_slice(b"0.5 0.5 0.5 0.5\0");

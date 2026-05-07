@@ -356,12 +356,22 @@ fn write_text_element<W: Write>(
     name: &str,
     text: &str,
 ) -> Result<(), WriteError> {
+    let cleaned = sanitize_xml_text(text);
     w.write_event(Event::Start(BytesStart::new(name.to_string())))
         .map_err(xml_err)?;
-    w.write_event(Event::Text(BytesText::new(text))).map_err(xml_err)?;
+    w.write_event(Event::Text(BytesText::new(&cleaned))).map_err(xml_err)?;
     w.write_event(Event::End(BytesEnd::new(name.to_string())))
         .map_err(xml_err)?;
     Ok(())
+}
+
+/// XML 1.0 forbids most C0 control characters even when escaped. Strip
+/// anything below U+0020 except TAB / LF / CR. Non-ASCII characters are
+/// passed through; quick-xml will encode them as UTF-8.
+fn sanitize_xml_text(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c >= ' ' || c == '\t' || c == '\n' || c == '\r')
+        .collect()
 }
 
 fn part_id(idx: usize) -> String {

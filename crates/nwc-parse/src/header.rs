@@ -99,45 +99,44 @@ pub fn parse_header(body: &[u8], report: &mut ConversionReport) -> Result<Header
     // 3 bytes of padding / reserved.
     cur.skip(3, "header padding")?;
 
-    // NWC 2.x score-info layout (verified against 2.01 corpus):
-    //   author cstr
-    //   licence-tag cstr  (registration token, ignored)
-    //   10 raw bytes      (always 8 zeros + u16 LE 0x0010)
+    // NWC 2.x score-info layout. Field order taken from music21's
+    // `binaryTranslate.py` (BSD), ported here:
+    //   user cstr             (the name visible in NWC's "User" field)
+    //   unknown cstr          (registration / licence token, ignored)
+    //   10 raw bytes
     //   title cstr
-    //   subtitle cstr
+    //   author cstr
+    //   lyricist cstr         (only for version >= 2.00)
     //   copyright1 cstr
     //   copyright2 cstr
-    //   comments cstr
-    let author = cur.read_cstr_lossy("author")?;
-    let licence_tag = cur.read_cstr_lossy("licence_tag")?;
-    let _ = licence_tag;
+    //   comment cstr
+    let _user = cur.read_cstr_lossy("user")?;
+    let _licence_tag = cur.read_cstr_lossy("licence_tag")?;
     cur.skip(10, "score-info reserved")?;
     let title = cur.read_cstr_lossy("title")?;
-    let subtitle = cur.read_cstr_lossy("subtitle")?;
+    let author = cur.read_cstr_lossy("author")?;
+    // The dedicated `lyricist` cstr was added in a later 2.x point release;
+    // NWC 2.01 does not have it. Empirical: in 2.01 the cstr after `author`
+    // is already `copyright1`. For now require minor >= 5 (i.e. ≥ 2.05) to
+    // read this field; tighten when corpus reveals a true threshold.
+    let lyricist = if version.major >= 2 && version.minor >= 5 {
+        cur.read_cstr_lossy("lyricist")?
+    } else {
+        String::new()
+    };
     let copyright1 = cur.read_cstr_lossy("copyright1")?;
     let copyright2 = cur.read_cstr_lossy("copyright2")?;
     let comments = cur.read_cstr_lossy("comments")?;
 
-    // Subtitle and lyricist are different concepts in NWC; fold subtitle
-    // into copyright lines is wrong, but treating it as a lyricist is also
-    // wrong. For M1 store it as the first comment line if comments is empty.
-    let merged_comments = match (nonempty(comments), nonempty(subtitle.clone())) {
-        (Some(c), Some(s)) => Some(format!("{s}\n{c}")),
-        (Some(c), None) => Some(c),
-        (None, Some(s)) => Some(s),
-        (None, None) => None,
-    };
-    let _ = subtitle;
-
     let info = ScoreInfo {
         title: nonempty(title),
         author: nonempty(author),
-        lyricist: None,
+        lyricist: nonempty(lyricist),
         copyright: [copyright1, copyright2]
             .into_iter()
             .filter(|s| !s.is_empty())
             .collect(),
-        comments: merged_comments,
+        comments: nonempty(comments),
     };
 
     // Note: staff_count and the offset where staves begin are determined by
