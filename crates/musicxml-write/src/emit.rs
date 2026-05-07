@@ -125,6 +125,32 @@ fn write_part_list<W: Write>(w: &mut Writer<W>, score: &Score) -> Result<(), Wri
         if let Some(abbr) = &staff.label_abbr {
             write_text_element(w, "part-abbreviation", abbr)?;
         }
+
+        // Include score-instrument + midi-instrument blocks. MuseScore uses
+        // these for playback timbre and (importantly) lets <transpose> in
+        // <attributes> drive the playback pitch offset rather than the
+        // built-in template for the named instrument.
+        let inst_id = format!("{id}-I1");
+        if let Some(inst_name) = &staff.instrument.name {
+            let mut si = BytesStart::new("score-instrument");
+            si.push_attribute(("id", inst_id.as_str()));
+            w.write_event(Event::Start(si)).map_err(xml_err)?;
+            write_text_element(w, "instrument-name", inst_name)?;
+            w.write_event(Event::End(BytesEnd::new("score-instrument"))).map_err(xml_err)?;
+        }
+        if let Some(prog) = staff.instrument.midi_program {
+            let mut mi = BytesStart::new("midi-instrument");
+            mi.push_attribute(("id", inst_id.as_str()));
+            w.write_event(Event::Start(mi)).map_err(xml_err)?;
+            let channel = staff.instrument.midi_channel.unwrap_or((idx as u8 % 16).saturating_add(1));
+            write_text_element(w, "midi-channel", &channel.to_string())?;
+            // MusicXML midi-program is 1-based (1..=128); NWC stores it the
+            // same way, so pass through unchanged. Clamp to the valid range.
+            let prog_clamped = prog.clamp(1, 128);
+            write_text_element(w, "midi-program", &prog_clamped.to_string())?;
+            w.write_event(Event::End(BytesEnd::new("midi-instrument"))).map_err(xml_err)?;
+        }
+
         w.write_event(Event::End(BytesEnd::new("score-part"))).map_err(xml_err)?;
     }
     w.write_event(Event::End(BytesEnd::new("part-list"))).map_err(xml_err)?;
@@ -322,22 +348,21 @@ fn write_attributes<W: Write>(
 }
 
 /// Emit a `<transpose>` element for an instrument that sounds N semitones
-/// away from its written pitch. Negative N = sounds lower than written
-/// (the usual case for transposing instruments like Bb trumpet, F horn).
+/// away from its written pitch. Negative N = sounds lower than written.
+///
+/// We emit the full chromatic interval as `<chromatic>` with no
+/// `<octave-change>` factoring. Some MusicXML importers (including older
+/// MuseScore versions) only apply `<chromatic>` for playback and ignore
+/// `<octave-change>`; emitting the full value is the most portable form.
 /// Diatonic step count is approximated as `chromatic * 7 / 12` rounded
 /// toward zero — the standard transposing intervals (Bb=−2/-1, Eb=−9/-5,
 /// F=−7/-4, A=−3/-2) all come out correct.
 fn write_transpose<W: Write>(w: &mut Writer<W>, chromatic: i8) -> Result<(), WriteError> {
     let chromatic_i = chromatic as i32;
-    let octave_change = chromatic_i / 12;
-    let chromatic_in_octave = chromatic_i - octave_change * 12;
     let diatonic = chromatic_i * 7 / 12;
     w.write_event(Event::Start(BytesStart::new("transpose"))).map_err(xml_err)?;
     write_text_element(w, "diatonic", &diatonic.to_string())?;
-    write_text_element(w, "chromatic", &chromatic_in_octave.to_string())?;
-    if octave_change != 0 {
-        write_text_element(w, "octave-change", &octave_change.to_string())?;
-    }
+    write_text_element(w, "chromatic", &chromatic_i.to_string())?;
     w.write_event(Event::End(BytesEnd::new("transpose"))).map_err(xml_err)?;
     Ok(())
 }
